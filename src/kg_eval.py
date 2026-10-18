@@ -1,57 +1,4 @@
-"""
-Post-hoc evaluation of the doctor's questions against a disease-phenotype knowledge graph.
 
-Default graph: the OMIM + Orphanet disease annotations of the Human Phenotype Ontology, as
-shipped with pyhpo (GRAPH = "hpo"). PrimeKG (Chandak, Huang & Zitnik, Scientific Data 2023) is
-still available with GRAPH = "primekg". Only structured disease-phenotype annotations are used:
-no LLM writes any disease profile. HPO terms also serve as the vocabulary of findings.
-
-Reads the results.json produced by the arena (a list of sim.run() results); the simulation is
-not touched. Meant to run after kg_coverage.py: its diagnosis links (kg_coverage.json) are
-reused, so exactly the cases it marked "covered" are scored, and the others cost no LLM call.
-
-Pipeline, per case:
-  1. The true diagnosis is linked to graph nodes (from kg_coverage.json, else by the LLM).
-     Cases not covered (or with fewer than MIN_DX_PHENOTYPES phenotypes) stop here.
-  2. The transcript is split into steps (ASK + answer, TEST + result + image reading); the
-     referral line, if present, is step 0 ("given", not credited to the doctor).
-  3. An LLM turns each step into findings of the CURRENT illness, present or absent, linked to
-     HPO terms chosen among retrieved candidates (identifiers are never invented). Equivalent
-     terms are grouped; a PRESENT finding coded with a term no disease uses falls back to its
-     nearest used ancestors.
-  4. The doctor's own diagnosis is linked to the graph the same way (for metrics A2 and B2).
-  5. A naive-Bayes model over all diseases with phenotypes is recomputed at every step from the
-     evidence gathered so far (repeats ignored, later status wins, hierarchy-implied findings
-     not counted twice).
-
-Metrics (see kg_metrics.tex for the formulas):
-  per step   info_gain_bits, eig_asked_bits, eig_best_bits, best_question, saturated,
-             true_rank, true_posterior, log_odds_true
-  per case   efficiency: mapped/unmapped/redundant/low-value fractions, mean_eig_ratio,
-               info_regret_bits (C1: sum over judged steps of best EIG - asked EIG)
-             reachability: final/min rank, percentile, band, posterior,
-               final/max_log_odds_true (B3: log2 P(true) / P(best other disease)),
-               steps_to_top1/10/50 (C2: first step with the true diagnosis in the top-K)
-             doctor's diagnosis: doctor_dx_rank, diagnostic_regret_bits (A2: log2 P(true) -
-               log2 P(doctor's); > 0 = the data favoured the true diagnosis),
-               n_discriminating (B2: observed findings annotated in only one of the two)
-             error_type: correct / synthesis_error (rank <= REACH_K) / gathering_error
-               (rank > UNREACH_K) / undetermined / kg_not_covered / mapping_failed
-
-All of this is "according to the graph". Report coverage, match type and the calibration check
-(ranks of correct vs incorrect cases, in the summary) together with any result.
-
-Usage:
-    python kg_coverage.py results.json --graphs hpo --model genai:gemini-3.5-flash-lite
-    python kg_eval.py results.json --model genai:gemini-3.5-flash-lite
-    # from a notebook:
-    import kg_eval
-    summary = kg_eval.evaluate("results.json", model="genai:gemini-3.5-flash-lite")
-
-Outputs: kg_eval.json (per case, step by step), kg_eval.csv (one row per case), kg_cache.json
-(per-case LLM mappings, reused on later runs).
-Requires: pip install pyhpo numpy   (pandas only for PrimeKG; clinical_sim.py importable)
-"""
 
 import argparse
 import csv
@@ -62,70 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-import clinical_sim as sim
 
-# --------------------------------------------------------------------------- #
-# Settings
-# --------------------------------------------------------------------------- #
-MODEL = None                  # None = sim.EXAMINER_MODEL; any "provider:model" accepted by sim.chat
-KG_PATH = "kg.csv"            # PrimeKG edge list (Harvard Dataverse)
-KG_CACHE = "primekg_phenotypes.json"
-GRAPH = "hpo"                 # "hpo": OMIM + Orphanet annotations shipped with pyhpo (default);
-                              # "primekg": PrimeKG (needs kg.csv or primekg_phenotypes.json)
-COVERAGE_PATH = "kg_coverage.json"   # output of kg_coverage.py: its diagnosis links are reused,
-                              # so the cases scored are exactly those it marked "covered"
-PROMPT_VERSION = "v2"         # part of the cache key: change it when the findings prompt changes
-
-P_HIT = 0.6                   # P(finding present | disease lists it, or a more specific form of it).
-                              # Annotation lists mix obligatory and occasional features and PrimeKG
-                              # has no frequencies: 0.8 made the absence of an occasional feature
-                              # (e.g. diarrhoea in ectopic ACTH) cost a factor 4.5.
-P_BACKGROUND = 0.1            # P(finding present | disease does not list it): the graph is incomplete
-P_EXCLUDED = 0.02             # P(finding present | disease explicitly listed as NOT having it)
-P_PARTIAL = 0.3               # P(finding present | disease lists only a more GENERAL form of it,
-                              # e.g. "Glomerulopathy" for an observed "Crescentic glomerulonephritis").
-                              # Annotations are often coarser than the findings: without this the
-                              # true disease got no credit at all. Only ancestors found in at most
-                              # PARTIAL_MAX_PREVALENCE of the diseases count (not headings).
-PARTIAL_MAX_PREVALENCE = 0.05
-ABSENT_WEIGHT = 0.3           # weight of an ABSENT finding in the update (tempered likelihood).
-                              # Annotation lists mix obligatory and occasional features, so a denied
-                              # symptom is weak evidence against a disease that lists it; at full
-                              # weight, diseases with many annotations fell below the unrelated ones
-                              # (in GLM runs, 8 correctly diagnosed cases had the truth ranked >1000).
-DAMPING = 0.0                 # evidence weight of each finding = (findings in its step) ** -DAMPING.
-                              # 0 = naive Bayes; 0.5 softens panels of correlated results
-                              # (e.g. acidosis + anion gap + hypokalaemia from one test)
-
-MIN_DX_PHENOTYPES = 5         # a diagnosis node needs this many phenotype relations to be scored
-REACH_K = 10                  # final rank <= REACH_K  -> the data gathered was enough
-UNREACH_K = 50                # final rank >  UNREACH_K -> it was not; in between: undetermined
-LOW_EIG_RATIO = 0.2           # a mapped step is "low value" if its EIG is below this fraction of
-                              # the best EIG available at that moment (relative: under a flat
-                              # posterior every single question is worth little in absolute bits) ...
-SATURATED_BITS = 1.0          # ... unless the posterior entropy is already below this: nothing
-                              # left to learn, so the step is not judged
-TOP_DISEASES_FOR_BEST = 30    # the best available question is searched among these diseases' findings
-MAX_TERM_PREVALENCE = 0.05    # best-question candidates: terms found in at most 5% of diseases
-                              # (excludes headings such as "Abnormality of the eye")
-BACKOFF_MAX_PREVALENCE = 0.02 # fallback ancestor of an unused term must be at least this specific
-
-STEPS_PER_CALL = 25           # transcript steps sent to the LLM per extraction call
-LINKS_PER_CALL = 30           # findings linked per call
-TERM_CANDIDATES = 6           # candidates retrieved per name (finding name and each alternative)
-MAX_LINK_CANDIDATES = 15
-DISEASE_CANDIDATES = 25
-EIG_BATCH = 256               # terms per expected-gain batch (memory)
-DISC_TAU = 0.4                # a finding discriminates two diagnoses if |p_v - p_m| >= DISC_TAU
-                              # (with the defaults: annotated in exactly one of the two)
-CONVERGENCE_KS = (1, 10, 50)  # steps_to_topK is reported for these K
-VERBOSE_UNCOVERED = False     # also print a line for each case not covered by the graph
-
-# result keys that may hold the presenting complaint (the referral line); first non-empty wins
-REFERRAL_KEYS = ("referral", "presenting_complaint", "chief_complaint", "opening_line", "opening")
-
-STOPWORDS = {"of", "the", "and", "in", "on", "with", "to", "a", "an", "or", "for", "by", "at",
-             "type", "disease", "syndrome", "disorder"}
 
 
 def _tokens(text, drop_stop=True):
@@ -134,9 +18,6 @@ def _tokens(text, drop_stop=True):
     return [t for t in toks if not (drop_stop and t in STOPWORDS)]
 
 
-# --------------------------------------------------------------------------- #
-# HPO vocabulary (terms, synonyms, hierarchy only; no diseases)
-# --------------------------------------------------------------------------- #
 class HPOVocab:
     def __init__(self):
         from pyhpo import Ontology
@@ -208,49 +89,7 @@ class HPOVocab:
         return [tid for _, tid in scored[:k]]
 
 
-# --------------------------------------------------------------------------- #
-# PrimeKG
-# --------------------------------------------------------------------------- #
-def _read_primekg(kg_path, cache_path):
-    """{disease id: {"name", "pos": [HP ids], "neg": [HP ids]}} for EVERY disease node.
 
-    Read once from kg.csv (only disease rows are kept) and cached as compact JSON.
-    """
-    cache_path = Path(cache_path)
-    if cache_path.exists():
-        return json.loads(cache_path.read_text(encoding="utf-8"))
-    import pandas as pd
-    kg_path = Path(kg_path)
-    if not kg_path.exists():
-        raise FileNotFoundError(
-            f"{kg_path} not found. Download PrimeKG's kg.csv from Harvard Dataverse "
-            "(https://dataverse.harvard.edu/api/access/datafile/6180620) and pass its path.")
-    print(f"[kg] reading {kg_path} once (a few minutes)...", flush=True)
-    cols = ["relation", "x_id", "x_type", "x_name", "x_source", "y_id", "y_type", "y_source"]
-    out = {}
-    for chunk in pd.read_csv(kg_path, usecols=cols, dtype=str, chunksize=1_000_000,
-                             low_memory=False):
-        dis = chunk[chunk["x_type"] == "disease"]
-        for src, xid, name in dis[["x_source", "x_id", "x_name"]].drop_duplicates().itertuples(
-                index=False):
-            out.setdefault(f"{src}:{xid}", {"name": name, "pos": [], "neg": []})
-        ph = dis[dis["relation"].isin(["disease_phenotype_positive",
-                                       "disease_phenotype_negative"])
-                 & (dis["y_type"] == "effect/phenotype")]
-        for rel, src, xid, ysrc, yid in ph[["relation", "x_source", "x_id", "y_source",
-                                            "y_id"]].itertuples(index=False):
-            try:
-                hp = f"HP:{int(yid):07d}" if ysrc == "HPO" else None
-            except ValueError:
-                hp = None
-            if hp:
-                out[f"{src}:{xid}"]["pos" if rel.endswith("positive") else "neg"].append(hp)
-    for d in out.values():
-        d["pos"], d["neg"] = sorted(set(d["pos"])), sorted(set(d["neg"]))
-    cache_path.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
-    n_ph = sum(1 for d in out.values() if d["pos"])
-    print(f"[kg] {len(out)} disease nodes, {n_ph} with phenotype relations -> {cache_path}")
-    return out
 
 
 def _read_hpo():
@@ -311,7 +150,6 @@ class DiseaseGraph:
         print(f"[kg] {label}: {len(self.all_ids)} disease nodes, {self.n} with phenotype "
               f"relations, {len(member)} phenotype terms in use")
 
-    # ---- names and counts ------------------------------------------------- #
     def term_name(self, tid):
         return self.vocab.term_name(tid)
 
@@ -330,7 +168,7 @@ class DiseaseGraph:
         k = self.all_index.get(node_id)
         return self.all_names[k] if k is not None else node_id
 
-    # ---- likelihoods ------------------------------------------------------ #
+ 
     def member(self, tid):
         if tid not in self._member:
             m = np.zeros(self.n, dtype=bool)
@@ -416,9 +254,7 @@ class DiseaseGraph:
         return ranked[:k]
 
 
-# --------------------------------------------------------------------------- #
-# Transcript -> steps
-# --------------------------------------------------------------------------- #
+
 def _image_reading(entry):
     """Text of a 'DOCTOR READS (file): ...' line, without the reader's differential."""
     text = entry.split(":", 1)[1] if ":" in entry else ""
@@ -481,9 +317,7 @@ def parse_transcript(transcript, referral=""):
     return steps
 
 
-# --------------------------------------------------------------------------- #
-# LLM mapping (findings, term links, diagnosis), validated against the graph
-# --------------------------------------------------------------------------- #
+
 FINDINGS_PROMPT = """You convert a clinical encounter into phenotypic findings coded with the Human
 Phenotype Ontology (HPO). You receive numbered steps: each is a physician's question with the
 patient's answer, or an ordered test with its result (for images, with the physician's reading).
@@ -746,9 +580,7 @@ def _resolve_picks(kg, items, cands):
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Findings -> evidence
-# --------------------------------------------------------------------------- #
+
 def resolve(kg, link, status="present"):
     """(group of HP ids, how) for one linked finding; (None, reason) if it carries nothing.
 
@@ -806,9 +638,6 @@ def log_likelihood(kg, evidence):
     return logp
 
 
-# --------------------------------------------------------------------------- #
-# Bayesian scoring
-# --------------------------------------------------------------------------- #
 def _entropy(p):
     q = p[p > 0]
     return float(-(q * np.log2(q)).sum())
@@ -967,9 +796,7 @@ def _r(x, nd):
     return None if x is None else round(float(x), nd)
 
 
-# --------------------------------------------------------------------------- #
-# Per case and over the whole results file
-# --------------------------------------------------------------------------- #
+
 def _key(result):
     payload = json.dumps([PROMPT_VERSION, result.get("case"), result.get("transcript"),
                           referral_text(result), result.get("true_diagnosis"),
